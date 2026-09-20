@@ -145,12 +145,8 @@ def report_retry(events: bool, task_id: int, label: str, attempt: int, delay: fl
     )
 
 
-def build_anti_abuse(config: dict, page_url: str, fingerprint, sidecar):
-    """按优先级选择反滥用 Token 来源：本地 Sidecar > 远程/静态 Token > Node SDK。"""
-    if sidecar is not None:
-        from providers.local_sidecar import LocalCastleProvider
-
-        return LocalCastleProvider(sidecar)
+def _legacy_anti_abuse(config: dict, page_url: str, fingerprint):
+    """原生反滥用令牌来源：静态/远程 Token 优先，否则用 Node SDK。"""
     if config.get("castle_provider_url") or config.get("castle_email_token") or config.get("castle_final_token"):
         return CastleTokenProvider(
             email_token=str(config.get("castle_email_token") or ""),
@@ -158,25 +154,58 @@ def build_anti_abuse(config: dict, page_url: str, fingerprint, sidecar):
             provider_url=str(config.get("castle_provider_url") or ""),
             provider_key=str(config.get("castle_provider_key") or ""),
         )
-    return CastleSdkTokenProvider(castle_publishable_key(config), page_url, fingerprint.user_agent)
+    try:
+        return CastleSdkTokenProvider(castle_publishable_key(config), page_url, fingerprint.user_agent)
+    except Exception:
+        # 无 Node 运行时 → 没有可用的备用来源
+        return None
 
 
-def build_human_verification(config: dict, fingerprint, proxies, sidecar):
-    """按优先级选择人机验证来源：本地 Sidecar > CapSolver。"""
+def build_anti_abuse(config: dict, page_url: str, fingerprint, sidecar, on_fallback=None):
+    """按优先级选择反滥用 Token 来源：本地 Sidecar > 远程/静态 Token > Node SDK。
+
+    Sidecar 可用时仍会挂上备用来源，实现文档 §7.2 的混合双轨容灾。
+    """
+    legacy = _legacy_anti_abuse(config, page_url, fingerprint)
     if sidecar is not None:
-        from providers.local_sidecar import LocalTurnstileProvider
+        from providers.local_sidecar import FallbackAntiAbuseProvider, LocalCastleProvider
 
-        return LocalTurnstileProvider(
+        primary = LocalCastleProvider(sidecar)
+        if legacy is None:
+            return primary
+        return FallbackAntiAbuseProvider(primary, legacy, on_fallback=on_fallback)
+    if legacy is None:
+        raise RuntimeError(
+            "Castle Token 来源不可用：请配置 CASTLE_PROVIDER_URL / CASTLE_*_TOKEN，"
+            "或安装 Node.js（Node SDK 模式），或启用 USE_LOCAL_SIDECAR"
+        )
+    return legacy
+
+
+def build_human_verification(config: dict, fingerprint, sidecar, on_fallback=None):
+    """按优先级选择人机验证来源：本地 Sidecar > CapSolver（双轨容灾）。"""
+    capsolver_key = str(config.get("capsolver_api_key") or "").strip()
+
+    def _capsolver():
+        return CapSolverProvider(
+            capsolver_key,
+            timeout=float(config.get("capsolver_timeout_sec", 120) or 120),
+            poll_interval=float(config.get("capsolver_poll_interval_sec", 1.0) or 1.0),
+            proxy=str(config.get("proxy") or "") if config.get("proxy_enabled", True) else "",
+            user_agent=fingerprint.user_agent,
+        )
+
+    if sidecar is not None:
+        from providers.local_sidecar import FallbackTurnstileProvider, LocalTurnstileProvider
+
+        primary = LocalTurnstileProvider(
             sidecar,
             timeout=float(config.get("sidecar_turnstile_timeout", 30) or 30),
         )
-    return CapSolverProvider(
-        str(config.get("capsolver_api_key") or ""),
-        timeout=float(config.get("capsolver_timeout_sec", 120) or 120),
-        poll_interval=float(config.get("capsolver_poll_interval_sec", 1.0) or 1.0),
-        proxy=str(config.get("proxy") or "") if config.get("proxy_enabled", True) else "",
-        user_agent=fingerprint.user_agent,
-    )
+        if not capsolver_key:
+            return primary
+        return FallbackTurnstileProvider(primary, _capsolver(), on_fallback=on_fallback)
+    return _capsolver()
 
 
 def start_local_sidecar(config: dict, proxies, fingerprint) -> tuple[Any, str]:
@@ -195,6 +224,7 @@ def start_local_sidecar(config: dict, proxies, fingerprint) -> tuple[Any, str]:
         headless=bool(config.get("sidecar_headless", True)),
         pool_size=int(config.get("sidecar_pool_size", 2) or 2),
         max_age_sec=float(config.get("sidecar_max_age_sec", 240) or 240),
+        castle_timeout=float(config.get("sidecar_castle_timeout", 20) or 20),
         browser_channel=str(config.get("sidecar_browser_channel") or ""),
         locale=str(config.get("sidecar_locale") or "en-US"),
         timezone_id=str(config.get("sidecar_timezone") or "America/New_York"),
@@ -213,6 +243,13 @@ def run_web_task(
 ):
     fingerprint = build_fingerprint(config)
     emit_event(events, "fingerprint", task=task_id, **fingerprint.public_metadata())
+
+    def _on_fallback(kind: str, exc: BaseException) -> None:
+        if events:
+            emit_event(True, "provider_fallback", task=task_id, kind=kind, error=f"{type(exc).__name__}: {exc}")
+        else:
+            print(f"[任务 {task_id}] {kind} 走 Sidecar 失败，回退备用 Provider：{type(exc).__name__}: {exc}", flush=True)
+
     base = PROTOCOL_TARGET_BASE
     page_url = str(config.get("protocol_page_url") or base + "/sign-up")
     client = AuthProtocolClient(
@@ -240,8 +277,8 @@ def run_web_task(
             expiry_time=int(config.get("moemail_expiry_time", 86_400_000) or 86_400_000),
             proxies=proxies if config.get("moemail_use_proxy") else None,
         ),
-        anti_abuse=build_anti_abuse(config, page_url, fingerprint, sidecar),
-        human_verification=build_human_verification(config, fingerprint, proxies, sidecar),
+        anti_abuse=build_anti_abuse(config, page_url, fingerprint, sidecar, on_fallback=_on_fallback),
+        human_verification=build_human_verification(config, fingerprint, sidecar, on_fallback=_on_fallback),
         on_progress=lambda stage: report_progress(events, stage, task_id),
         on_retry=lambda label, attempt, delay, error: report_retry(events, task_id, label, attempt, delay, error),
     )
@@ -264,16 +301,34 @@ def sidecar_check(config: dict, proxies, events: bool, produce: bool = False) ->
     try:
         payload: dict[str, Any] = {"success": True, **service.status()}
         if produce:
+            from sidecar.browser_worker import SELFTEST_CONTAINER, TURNSTILE_TEST_SITEKEY
+
             timeout = float(config.get("sidecar_turnstile_timeout", 30) or 30)
             started = time.monotonic()
-            turnstile = service.acquire_turnstile(timeout=timeout)
-            castle = service.acquire_castle()
-            payload.update(
-                {
-                    "turnstile_token_length": len(turnstile),
-                    "castle_token_length": len(castle),
-                    "elapsed_ms": round((time.monotonic() - started) * 1000),
-                }
+            # 自检：先用官方 always-pass 测试 key 验证 Sidecar 自身是否正常，
+            # 以此区分「Sidecar 故障」与「出口 IP 被风控拒绝（真实 sitekey 不渲染）」
+            try:
+                test_token = service.worker.produce_turnstile_token(
+                    timeout=min(timeout, 20.0),
+                    sitekey=TURNSTILE_TEST_SITEKEY,
+                    container=SELFTEST_CONTAINER,
+                )
+                payload["self_test"] = {"ok": True, "token_length": len(test_token)}
+            except Exception as exc:
+                payload["self_test"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            try:
+                turnstile = service.acquire_turnstile(timeout=timeout)
+                payload["turnstile_token_length"] = len(turnstile)
+            except Exception as exc:
+                payload["turnstile_error"] = f"{type(exc).__name__}: {exc}"
+            try:
+                castle = service.acquire_castle()
+                payload["castle_token_length"] = len(castle)
+            except Exception as exc:
+                payload["castle_error"] = f"{type(exc).__name__}: {exc}"
+            payload["elapsed_ms"] = round((time.monotonic() - started) * 1000)
+            payload["success"] = bool(payload.get("self_test", {}).get("ok")) and bool(
+                payload.get("turnstile_token_length")
             )
     except Exception as exc:
         payload = {"success": False, "error": f"{type(exc).__name__}: {exc}"}

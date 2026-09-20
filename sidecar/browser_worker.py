@@ -28,6 +28,7 @@ from urllib.parse import unquote, urlsplit
 HARNESS_URL = "https://accounts.x.ai/__turnstile_harness__"
 HARNESS_PATH = Path(__file__).parent / "harness.html"
 HARNESS_ROUTE_PATTERN = re.compile(r"^https://accounts\.x\.ai/__turnstile_harness__")
+DEFAULT_CONTAINER = "#cf-turnstile-widget"
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
@@ -40,6 +41,11 @@ CHECKBOX_SELECTORS = (
 )
 INTERACTIVE_SELECTORS = (".ctp-image-grid", "#challenge-success", ".ctp-opacity-grid")
 SHUTDOWN_TIMEOUT = 10.0
+# Cloudflare 官方 "always passes" 测试 sitekey：不做风险评估，用于把
+# 「Sidecar 自身故障」与「出口 IP / 环境被风控拒绝」区分开
+TURNSTILE_TEST_SITEKEY = "1x00000000000000000000AA"
+# 自检专用容器：Turnstile 禁止同一容器在 render/execute 之间更换 sitekey
+SELFTEST_CONTAINER = "#cf-turnstile-selftest"
 
 STEALTH_INIT_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -408,6 +414,18 @@ class BrowserWorker:
                 "() => typeof window.turnstile !== 'undefined'",
                 timeout=min(self.start_timeout, 20.0) * 1000,
             )
+            # render=explicit 下必须等 ready 回调，否则 render() 会静默失败
+            state = self._page.evaluate(
+                "() => new Promise((resolve) => {"
+                "  let settled = false;"
+                "  const done = (value) => { if (!settled) { settled = true; resolve(value); } };"
+                "  try { window.turnstile.ready(() => done('ready')); }"
+                "  catch (err) { done('error: ' + String((err && err.message) || err)); }"
+                "  setTimeout(() => done('timeout'), 10000);"
+                "})"
+            )
+            if state != "ready":
+                self._last_error = f"turnstile not ready: {state}"
         except Exception as exc:
             self._last_error = f"turnstile sdk not ready: {exc}"
         try:
@@ -452,33 +470,62 @@ class BrowserWorker:
             **(snapshot or {}),
         }
 
-    def produce_turnstile_token(self, action: str = "", timeout: float = 25.0) -> str:
+    def produce_turnstile_token(
+        self,
+        action: str = "",
+        timeout: float = 25.0,
+        sitekey: str = "",
+        container: str = "",
+    ) -> str:
         self._ensure_started()
         token = self._submit(
-            lambda: self._produce_turnstile_inner(action, timeout),
+            lambda: self._produce_turnstile_inner(action, timeout, sitekey, container),
             timeout + 10.0,
         )
         return token
 
-    def _produce_turnstile_inner(self, action: str, timeout: float) -> str:
+    def _produce_turnstile_inner(
+        self,
+        action: str,
+        timeout: float,
+        sitekey: str = "",
+        container: str = "",
+    ) -> str:
+        target_sitekey = str(sitekey or "").strip() or self.sitekey
+        target_container = str(container or "").strip() or DEFAULT_CONTAINER
         rendered = self._page.evaluate(
-            "([sitekey, action]) => renderTurnstile(sitekey, action || undefined)",
-            [self.sitekey, str(action or "").strip()],
+            "([sitekey, action, container]) => renderTurnstile(sitekey, action || undefined, container || undefined)",
+            [target_sitekey, str(action or "").strip(), target_container],
         )
         if not rendered:
-            error = self._page.evaluate("() => window._turnstileError")
-            raise TurnstileChallengeError(f"Turnstile SDK 未就绪: {error or 'UNKNOWN'}")
+            error = self._page.evaluate("(sel) => window._turnstileErrors[sel] || window._turnstileError", target_container)
+            raise TurnstileChallengeError(f"Turnstile 渲染失败: {error or 'UNKNOWN'}")
 
-        deadline = time.monotonic() + max(1.0, float(timeout))
+        started = time.monotonic()
+        deadline = started + max(1.0, float(timeout))
         last_click = 0.0
         while time.monotonic() < deadline:
-            token = self._page.evaluate("() => window._turnstileToken")
+            state = self._page.evaluate(
+                "(sel) => ({token: window._turnstileTokens[sel], error: window._turnstileErrors[sel],"
+                " frames: document.querySelectorAll('iframe').length})",
+                target_container,
+            )
+            token = (state or {}).get("token")
             if token:
                 self._tokens_produced += 1
                 return str(token)
-            error = self._page.evaluate("() => window._turnstileError")
+            error = (state or {}).get("error")
             if error:
                 raise TurnstileChallengeError(f"Turnstile 挑战失败: {error}")
+            # 静默失败兜底：widget 迟迟不创建 iframe，说明 Cloudflare 未真正下发挑战。
+            # 两种典型原因：(1) api.js 带了 async/defer；(2) 真实 sitekey 的风险评估
+            # 判定当前出口 IP/环境不可信，直接 no-op（用官方测试 key 可区分）。
+            if not (state or {}).get("frames") and time.monotonic() - started > 12.0:
+                raise TurnstileChallengeError(
+                    "Turnstile 未创建挑战 iframe（widget 静默失败）：请确认 harness.html 中 "
+                    "api.js 未使用 async/defer；若使用真实 sitekey，通常是当前出口 IP 信誉不足，"
+                    "需配置住宅代理（可用 --sidecar-check --sidecar-produce 的 self_test 字段区分）"
+                )
             now = time.monotonic()
             if now - last_click > 1.5:
                 last_click = now
@@ -488,13 +535,17 @@ class BrowserWorker:
 
     def produce_castle_token(self, timeout: float = 20.0) -> str:
         self._ensure_started()
-        return self._submit(self._produce_castle_inner, timeout + 10.0)
+        # 浏览器线程可能正被补水任务占用，这里留足排队余量，避免误报为空错误
+        return self._submit(lambda: self._produce_castle_inner(timeout), timeout + 60.0)
 
-    def _produce_castle_inner(self) -> str:
+    def _produce_castle_inner(self, timeout: float = 20.0) -> str:
         if not self.castle_pk:
             raise SidecarError("Castle publishable key 为空")
         try:
-            token = self._page.evaluate("() => acquireCastleToken()")
+            token = self._page.evaluate(
+                "(ms) => acquireCastleToken(ms)",
+                int(max(1.0, float(timeout)) * 1000),
+            )
         except Exception as exc:
             raise SidecarError(f"Castle SDK 未返回有效 Token: {exc}") from exc
         if not token:

@@ -6,6 +6,7 @@ from sidecar.browser_worker import (
     SidecarError,
     SidecarUnavailable,
     TokenPair,
+    TURNSTILE_TEST_SITEKEY,
     TurnstileChallengeError,
 )
 from sidecar.service import LocalSidecarService
@@ -18,6 +19,7 @@ __all__ = [
     "LocalSidecarService",
     "SidecarError",
     "SidecarUnavailable",
+    "TURNSTILE_TEST_SITEKEY",
     "TokenPair",
     "TokenPool",
     "TurnstileChallengeError",

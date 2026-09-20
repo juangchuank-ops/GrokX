@@ -45,6 +45,7 @@ class TokenPool:
         max_age_sec: float = DEFAULT_MAX_AGE_SEC,
         action: str = "",
         produce_timeout: float = 25.0,
+        castle_timeout: float = 20.0,
         unhealthy_threshold: int = DEFAULT_UNHEALTHY_THRESHOLD,
         restart_after: int = DEFAULT_RESTART_AFTER,
         on_event: Optional[Callable[[str, dict[str, Any]], None]] = None,
@@ -54,6 +55,7 @@ class TokenPool:
         self.max_age_sec = max(30.0, float(max_age_sec))
         self.action = str(action or "")
         self.produce_timeout = max(1.0, float(produce_timeout))
+        self.castle_timeout = max(1.0, float(castle_timeout))
         self.unhealthy_threshold = max(1, int(unhealthy_threshold))
         self.restart_after = max(1, int(restart_after))
         self.on_event = on_event or (lambda _event, _payload: None)
@@ -170,8 +172,10 @@ class TokenPool:
                 self._purge_expired()
                 with self._lock:
                     need = self.pool_size - len(self._queue)
+                    failures = self._consecutive_failures
                 if need <= 0:
-                    time.sleep(0.3)
+                    # 池满时按失败次数退避，避免在坏环境下空转刷屏
+                    time.sleep(min(0.3 * (2 ** min(failures, 5)), 10.0) if failures else 0.3)
                     continue
                 token = self.worker.produce_turnstile_token(
                     self.action,
@@ -183,13 +187,19 @@ class TokenPool:
                 self._maybe_soft_restart()
             except InteractiveChallengeError as exc:
                 self._register_failure(exc)
-                time.sleep(2.0)
+                time.sleep(self._backoff())
             except (TurnstileChallengeError, SidecarError) as exc:
                 self._register_failure(exc)
-                time.sleep(1.0)
+                time.sleep(self._backoff())
             except Exception as exc:  # 兜底，避免补水线程静默死亡
                 self._register_failure(exc)
-                time.sleep(1.0)
+                time.sleep(self._backoff())
+
+    def _backoff(self) -> float:
+        """失败越多退避越久：既避免刷屏，也避免长时间占用浏览器线程饿死其它请求。"""
+        with self._lock:
+            failures = self._consecutive_failures
+        return min(float(failures) * 1.5, 30.0)
 
     # ------------------------------------------------------------------ 业务消费
 
@@ -212,7 +222,7 @@ class TokenPool:
         last_error: Optional[BaseException] = None
         for attempt in range(1, max(1, int(attempts)) + 1):
             try:
-                token = self.worker.produce_castle_token()
+                token = self.worker.produce_castle_token(timeout=self.castle_timeout)
                 self.on_event("castle_produced", {"attempt": attempt})
                 return token
             except Exception as exc:

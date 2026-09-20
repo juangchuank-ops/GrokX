@@ -31,6 +31,7 @@ class LocalSidecarService:
         headless: bool = True,
         pool_size: int = 2,
         max_age_sec: float = DEFAULT_MAX_AGE_SEC,
+        castle_timeout: float = 20.0,
         browser_channel: str = "",
         locale: str = "en-US",
         timezone_id: str = "America/New_York",
@@ -57,6 +58,7 @@ class LocalSidecarService:
             pool_size=pool_size,
             max_age_sec=max_age_sec,
             action=self.action,
+            castle_timeout=castle_timeout,
             on_event=on_event,
         )
         self._started = False

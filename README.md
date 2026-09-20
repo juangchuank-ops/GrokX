@@ -135,6 +135,7 @@ cp .env.example .env
 | `SIDECAR_HEADLESS` / `SIDECAR_POOL_SIZE` / `SIDECAR_MAX_AGE_SEC` | ❌ | Sidecar 运行参数（池容量默认 2，Token TTL 默认 240s） |
 | `SIDECAR_BROWSER_CHANNEL` / `SIDECAR_LOCALE` / `SIDECAR_TIMEZONE` | ❌ | 指定浏览器渠道（`chrome`/`msedge`）与语言/时区 |
 | `SIDECAR_TURNSTILE_TIMEOUT` | ❌ | 单次 Turnstile 求解超时（默认 30s） |
+| `SIDECAR_CASTLE_TIMEOUT` | ❌ | 单次 Castle Token 提取超时（默认 20s） |
 | `STEP_ATTEMPTS` / `STEP_BACKOFF` / `MAX_STEP_BACKOFF` | ❌ | 状态机步骤级重试次数与退避上限 |
 | `FINGERPRINT_MODE` / `ACCEPT_LANGUAGE` / `FINGERPRINT_REGION` | ❌ | 指纹模式与语言偏好（应与代理出口区域一致） |
 | `MOEMAIL_DOMAIN` / `MOEMAIL_EXPIRY_TIME` / `MOEMAIL_USE_PROXY` | ❌ | MoeMail 细节 |
@@ -220,20 +221,39 @@ python main.py --output-json path/to/result.json
 
 1. **域名白名单绕过（Origin Spoofing）**：Turnstile 会校验 `window.location.origin`。Sidecar 用 Playwright 路由拦截，把 `https://accounts.x.ai/__turnstile_harness__` 直接 fulfill 成本地 `harness.html`，浏览器地址栏与 DOM 上下文归属真实注册域，且不产生真实网络请求。
 2. **专用浏览器线程**：Playwright 同步 API 的事件循环绑定在创建它的线程上，跨线程调用会抛 `greenlet.error: Cannot switch to a different thread`。因此 `BrowserWorker` 把所有浏览器操作投递到一条专用线程的命令队列里串行执行，对外仍是同步方法，可被补水线程与并发业务线程安全调用。
-3. **Token 缓冲池**：FIFO 队列 + 240s TTL 淘汰 + 自适应补水；连续 3 次失败上报 `proxy_unhealthy` 并软重启 Context，累计产出 100 个 Token 后自动重建 Context 清理内存。
+3. **Token 缓冲池**：FIFO 队列 + 240s TTL 淘汰 + 自适应补水；连续 3 次失败上报 `proxy_unhealthy` 并软重启 Context，累计产出 100 个 Token 后自动重建 Context 清理内存；失败越多退避越久，避免在坏环境下占满浏览器线程。
 4. **代理闭环**：浏览器实例挂载与 `PROXY` 相同的出口（`socks5h` 自动转为 Chromium 可用的 `socks5`），使「Turnstile 求解 / Castle 上报 / 发信 RPC / 注册 RPC」四者出口一致。
-5. **平滑降级**：Sidecar 启动失败（缺依赖、无 Chromium）时自动回退到 CapSolver + Node SDK，流水线不中断。
+5. **混合双轨容灾**：Sidecar 启动失败（缺依赖、无 Chromium）时回退到 CapSolver + Node SDK；即使 Sidecar 已启动，单个环节失败也会自动回退到备用 Provider（`provider_fallback` 事件），流水线不中断。
+6. **两个官方 SDK 的坑（实机验证才暴露）**：
+   - Turnstile 的 `api.js` **不能**带 `async defer`，否则 `render()` 静默失败——不建 iframe、不触发 error-callback、token 永远不返回；
+   - Castle 的 `createRequestToken()` 返回的是**只有 `then`、没有 `catch`** 的自定义 thenable，必须用 `then(onFulfilled, onRejected)` 两参形式，并加 JS 侧超时。
 
 ### 实机验证
 
-在本机（Windows + Chrome）上执行 `python main.py --sidecar-check --sidecar-produce`：
-
-```text
-Harness 环境: turnstile=true, castle=true, castleConfigured=true,
-              webdriver=null, viewport=1280x800, languages=[en-US, en]
+```bash
+python main.py --sidecar-check --sidecar-produce
 ```
 
-浏览器实例正常启动、Harness 路由劫持生效、Turnstile 与 Castle SDK 均加载成功、`navigator.webdriver` 已被抹除。
+本机（Windows + 本机 Chrome）实测结果：
+
+```json
+{
+  "harness": {
+    "turnstile": true, "castle": true, "castleConfigured": true,
+    "webdriver": null, "viewport": {"width": 1280, "height": 800},
+    "languages": ["en-US", "en"]
+  },
+  "self_test": { "ok": true, "token_length": 21 },
+  "turnstile_error": "Turnstile 未创建挑战 iframe（widget 静默失败）…",
+  "castle_error": "Castle createRequestToken timeout"
+}
+```
+
+- **`self_test.ok = true`**：用 Cloudflare 官方 always-pass 测试 key（`1x00000000000000000000AA`）走完整链路，**真实拿到了 Turnstile token**，证明 Harness、路由劫持、无头环境、轮询与回传全部正常。
+- **`turnstile_error`**：真实 sitekey 下 widget 不渲染。真实 key 会做风险评估，而测试 key 不会——在本机直连（无代理）环境下 Cloudflare 直接不下发挑战。这正是文档强调「Turnstile / Castle / 注册 RPC 必须走同一条住宅代理」的原因，**配置 `PROXY` 后复测即可**。
+- **`castle_error`**：Castle 的 `createRequestToken` 在本机环境下 60s 内不兑现且无任何网络请求，同样指向出口 IP/环境被风控；此时会自动回退到 Node SDK 或远程供应商。
+
+> 也就是说：**Sidecar 本身已验证可用**，`--sidecar-produce` 的 `self_test` 字段专门用于把「Sidecar 故障」与「出口 IP 被风控拒绝」区分开——如果 `self_test.ok` 为 true 而真实 key 失败，问题在代理出口，不在代码。
 
 ## 测试
 
@@ -241,7 +261,7 @@ Harness 环境: turnstile=true, castle=true, castleConfigured=true,
 python -m unittest discover tests
 ```
 
-当前覆盖 **64 个用例**，包括：protobuf/gRPC-Web 字节级编解码、`CreateUserAndSessionV2` 嵌套字段布局回放、指纹 TLS/UA 一致性、CapSolver 代理透传、Token 缓冲池 TTL/补水/降级、状态机步骤级重试、账号去特征化生成。
+当前覆盖 **75 个用例**，包括：protobuf/gRPC-Web 字节级编解码、`CreateUserAndSessionV2` 嵌套字段布局回放、指纹 TLS/UA 一致性、CapSolver 代理透传、Token 缓冲池 TTL/补水/降级、状态机步骤级重试、账号去特征化生成、Sidecar 双轨容灾回退与自检容器隔离。
 
 ## 合规提示
 

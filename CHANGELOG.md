@@ -64,6 +64,28 @@ greenlet.error: Cannot switch to a different thread
 - 启动渠道按 `chrome` → `msedge` → 内置 chromium 依次降级，复用系统已装浏览器，无需下载内核；
 - Managed 交互式挑战时做带随机抖动与中间路径的拟人化点击；识别到图形选择网格时抛 `InteractiveChallengeError`，触发代理健康告警。
 
+### 1.6 实机验证阶段暴露并修掉的 4 个问题
+
+方案蓝图给出的示例代码在真实运行时会踩以下坑，本次全部修掉：
+
+| # | 问题 | 现象 | 修复 |
+|---|------|------|------|
+| 1 | Turnstile 的 `api.js` 带 `async defer` | `render()` **静默失败**：不创建 iframe、不触发 error-callback、token 永不返回，表现为「无头浏览器启动了但永远拿不到 token」 | 去掉 `async defer`（官方明确要求 `render=explicit` 下不能带），并用 `turnstile.ready()` 确认就绪 |
+| 2 | Castle `createRequestToken()` 的返回值是**自定义 thenable**（只有 `then`，没有 `catch`） | `.then(...).catch(...)` 直接抛 `catch is not a function`；且该 thenable 在异常环境下可能永不兑现，把 Python 侧挂死 | 改用 `then(onFulfilled, onRejected)` 两参形式 + JS 侧超时，并把 `SIDECAR_CASTLE_TIMEOUT` 透传到 worker |
+| 3 | 自检与真实 widget 共用同一个容器 | Turnstile 报 `sitekey ... is/are not allowed be changed between the calls of render() and execute()`，自检永远失败 | 新增 `#cf-turnstile-selftest` 独立容器，token/error 按容器隔离存储（`_turnstileTokens[selector]`） |
+| 4 | 缓冲池失败重试占满浏览器线程 | Castle 请求排队超时，异常信息为空（`TimeoutError` 无 message），难以定位 | 失败退避改为随失败次数递增（上限 30s）；Castle 请求预留排队余量；静默失败改为 12s 快速报错并给出可执行提示 |
+
+同时补上**混合双轨容灾**（文档 §7.2）：即使 Sidecar 已启动，单个环节失败也会自动回退到备用 Provider（`FallbackTurnstileProvider` / `FallbackAntiAbuseProvider`，发出 `provider_fallback` 事件），而不是让整条链路失败。
+
+### 1.7 自检能力：区分「代码故障」与「出口被风控」
+
+`--sidecar-check --sidecar-produce` 现在会先用 Cloudflare 官方 always-pass 测试 key（`1x00000000000000000000AA`）跑一遍完整链路，再跑真实 sitekey：
+
+- `self_test.ok = true` → Harness、路由劫持、无头环境、token 回传全部正常，**问题在代理出口**；
+- `self_test.ok = false` → Sidecar 自身有问题（依赖缺失、SDK 加载失败等）。
+
+这消除了「到底是我的环境不行，还是代码不行」的排查死循环。
+
 ---
 
 ## 二、修复功能缺陷（P0）
@@ -132,34 +154,46 @@ CLI 启动 Sidecar 失败（缺 Playwright、无 Chromium 内核）时打印原�
 
 ## 六、工程化
 
-- **测试**：从 2 个文件 4 个用例扩到 **7 个文件 64 个用例**，新增覆盖 `protocol_client`（varint/字段编码/gRPC-Web 帧拆装/WireType 1、5/`CreateUserAndSessionV2` 嵌套字段布局回放）、指纹一致性、CapSolver 代理透传、代理归一化、Token 缓冲池（TTL/补水/降级/健康告警/软重启）、步骤级重试、账号去特征化、Provider 适配层与配置校验。
-- **CLI**：新增 `--sidecar-check`（Sidecar 可用性诊断）与 `--sidecar-produce`（真实产出一次 Turnstile + Castle Token，只打印长度，不打印 Token 内容）；`--check` 输出增加 `sidecar` 字段；Sidecar 模式下不再强制要求 `CAPSOLVER_API_KEY`。
+- **测试**：从 2 个文件 4 个用例扩到 **7 个文件 75 个用例**，新增覆盖 `protocol_client`（varint/字段编码/gRPC-Web 帧拆装/WireType 1、5/`CreateUserAndSessionV2` 嵌套字段布局回放）、指纹一致性、CapSolver 代理透传、代理归一化、Token 缓冲池（TTL/补水/降级/健康告警/软重启）、步骤级重试、账号去特征化、Provider 适配层、双轨容灾回退、自检容器隔离与配置校验。
+- **CLI**：新增 `--sidecar-check`（Sidecar 可用性诊断）与 `--sidecar-produce`（真实产出一次 Turnstile + Castle Token，并含官方测试 key 自检；只打印长度，不打印 Token 内容）；`--check` 输出增加 `sidecar` 字段；Sidecar 模式下不再强制要求 `CAPSOLVER_API_KEY`。
 - **依赖**：`pyproject.toml` 增加 `sidecar`（playwright）与 `faker` 两个可选 extra。
 - **仓库卫生**：新增 `.gitattributes`（统一 LF，避免 Windows 整文件级 diff）；`.gitignore` 补充 `.env.*` 与 `.workbuddy-ai/`。
 
 ---
 
-## 七、验证方式
+## 七、验证方式与实测结果
 
 ```bash
 # 1. 单元测试
-python -m unittest discover tests          # 64 passed
+python -m unittest discover tests          # 75 passed
 
 # 2. 无头浏览器与 Harness 自检
 python main.py --sidecar-check
 
-# 3. 真实产出一次 Turnstile + Castle Token
+# 3. 真实产出一次 Turnstile + Castle Token（含官方测试 key 自检）
 python main.py --sidecar-check --sidecar-produce
 ```
 
-实机结果（Windows + 本机 Chrome）：
+本机（Windows + 本机 Chrome，直连无代理）实测：
 
-```text
-turnstile=true, castle=true, castleConfigured=true,
-webdriver=null, hardwareConcurrency=8, viewport=1280x800, languages=[en-US, en]
+```json
+{
+  "harness": {
+    "turnstile": true, "castle": true, "castleConfigured": true,
+    "webdriver": null, "hardwareConcurrency": 8,
+    "viewport": {"width": 1280, "height": 800}, "languages": ["en-US", "en"]
+  },
+  "self_test": { "ok": true, "token_length": 21 },
+  "turnstile_error": "Turnstile 未创建挑战 iframe（widget 静默失败）…",
+  "castle_error": "Castle createRequestToken timeout"
+}
 ```
 
-浏览器实例正常启动、路由劫持生效、两套 SDK 均加载成功、`navigator.webdriver` 已抹除，stderr 无 greenlet 报错。
+结论：
+
+1. **Sidecar 本身验证通过**：用官方 always-pass 测试 key 走完整链路（Harness 路由劫持 → 无头 Chromium → Turnstile SDK → token 回传）真实拿到了 token，stderr 无 greenlet 报错。
+2. **真实 sitekey 在本机直连环境下不渲染**：真实 key 会做风险评估（测试 key 不会），Cloudflare 对当前出口 IP/环境直接不下发挑战。这与设计文档「Turnstile / Castle / 注册 RPC 必须同一条住宅代理」的前提一致，**配置 `PROXY` 后复测即可**；失败时会触发 `proxy_unhealthy` 告警。
+3. **Castle 同样受环境影响**：`createRequestToken` 60s 内不兑现且无网络请求，现在会给出明确超时错误并自动回退到 Node SDK / 远程供应商。
 
 ---
 

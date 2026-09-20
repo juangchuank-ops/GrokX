@@ -7,8 +7,12 @@ import time
 import unittest
 
 from sidecar.browser_worker import (
+    BrowserWorker,
+    DEFAULT_CONTAINER,
     InteractiveChallengeError,
+    SELFTEST_CONTAINER,
     SidecarError,
+    TURNSTILE_TEST_SITEKEY,
     TurnstileChallengeError,
     playwright_proxy_kwargs,
 )
@@ -153,6 +157,49 @@ class TokenPoolTest(unittest.TestCase):
         pool2 = self._pool(worker2)
         with self.assertRaises(SidecarError):
             pool2.get_castle_token(attempts=1)
+
+
+class BrowserWorkerSitekeyTest(unittest.TestCase):
+    """验证 self_test 用的 sitekey 覆盖真的生效（不必启动真实浏览器）。"""
+
+    class _FakePage:
+        def __init__(self):
+            self.calls: list[tuple[str, object]] = []
+
+        def evaluate(self, expression, arg=None):
+            self.calls.append((expression, arg))
+            if "renderTurnstile" in expression:
+                return True
+            return {"token": "tok", "error": None, "frames": 1}
+
+    def _worker(self) -> BrowserWorker:
+        worker = BrowserWorker(sitekey="0xRealKey")
+        worker._started = True  # noqa: SLF001 - 跳过真实浏览器启动
+        worker._page = self._FakePage()  # noqa: SLF001
+        worker._submit = lambda fn, timeout: fn()  # type: ignore[method-assign]  # noqa: SLF001
+        return worker
+
+    def test_default_sitekey_used(self):
+        worker = self._worker()
+        self.assertEqual("tok", worker.produce_turnstile_token(timeout=1))
+        render_call = next(call for call in worker._page.calls if "renderTurnstile" in call[0])  # noqa: SLF001
+        self.assertEqual("0xRealKey", render_call[1][0])
+
+    def test_override_sitekey_is_used(self):
+        worker = self._worker()
+        self.assertEqual("tok", worker.produce_turnstile_token(timeout=1, sitekey=TURNSTILE_TEST_SITEKEY))
+        render_call = next(call for call in worker._page.calls if "renderTurnstile" in call[0])  # noqa: SLF001
+        self.assertEqual(TURNSTILE_TEST_SITEKEY, render_call[1][0])
+
+    def test_self_test_uses_its_own_container(self):
+        worker = self._worker()
+        worker.produce_turnstile_token(timeout=1, sitekey=TURNSTILE_TEST_SITEKEY, container=SELFTEST_CONTAINER)
+        render_call = next(call for call in worker._page.calls if "renderTurnstile" in call[0])  # noqa: SLF001
+        self.assertEqual(SELFTEST_CONTAINER, render_call[1][2])
+        self.assertNotEqual(DEFAULT_CONTAINER, render_call[1][2])
+
+    def test_test_sitekey_is_the_official_always_pass_key(self):
+        self.assertEqual("1x00000000000000000000AA", TURNSTILE_TEST_SITEKEY)
 
 
 if __name__ == "__main__":
