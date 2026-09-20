@@ -1,4 +1,5 @@
 .env
+.env.*
 
 __pycache__/
 *.py[cod]
@@ -14,6 +15,8 @@ providers/castle_sdk/node_modules/
 output/
 data/
 
+# 本地工具与 Agent 工作目录（含笔记，不应公开）
+.workbuddy-ai/
 .DS_Store
 Thumbs.db
 .idea/

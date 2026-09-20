@@ -14,7 +14,17 @@ from providers.turnstile_flow import AcquiredToken, ChallengeContext
 
 CREATE_TASK_URL = "https://api.capsolver.com/createTask"
 GET_TASK_RESULT_URL = "https://api.capsolver.com/getTaskResult"
-TASK_TYPE = "AntiTurnstileTaskProxyLess"
+TASK_TYPE_PROXYLESS = "AntiTurnstileTaskProxyLess"
+TASK_TYPE_PROXY = "AntiTurnstileTask"
+# CapSolver 的代理协议枚举与 URL scheme 的映射（它不认识 socks5h）
+CAPSOLVER_PROXY_TYPES = {
+    "http": "http",
+    "https": "http",
+    "socks4": "socks4",
+    "socks4a": "socks4",
+    "socks5": "socks5",
+    "socks5h": "socks5",
+}
 
 
 class CapSolverError(RuntimeError):
@@ -95,19 +105,44 @@ class CapSolverProvider:
                 raise CapSolverError("CANCELLED", "task cancelled")
             time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
-    def acquire(self, challenge: ChallengeContext) -> AcquiredToken:
-        if self.cancelled():
-            raise CapSolverError("CANCELLED", "task cancelled")
-        if not str(challenge.page_url or "").strip():
-            raise ValueError("Turnstile page URL is empty")
-        if not str(challenge.sitekey or "").strip():
-            raise ValueError("Turnstile sitekey is empty")
+    def _proxy_fields(self) -> dict[str, Any]:
+        """把已配置的代理转换成 CapSolver 的 proxy* 参数。
 
+        未配置代理时返回空字典，此时才允许退化为 ProxyLess 任务类型。
+        """
+        if not self.proxy:
+            return {}
+        from urllib.parse import unquote, urlsplit
+
+        parts = urlsplit(self.proxy)
+        scheme = (parts.scheme or "http").lower()
+        proxy_type = CAPSOLVER_PROXY_TYPES.get(scheme)
+        if not proxy_type:
+            raise CapSolverError("UNSUPPORTED_PROXY", f"CapSolver 不支持代理协议 {scheme}")
+        if not parts.hostname or not parts.port:
+            raise CapSolverError("INVALID_PROXY", "代理地址缺少主机或端口")
+        fields: dict[str, Any] = {
+            "proxyType": proxy_type,
+            "proxyAddress": parts.hostname,
+            "proxyPort": int(parts.port),
+        }
+        if parts.username:
+            fields["proxyLogin"] = unquote(parts.username)
+        if parts.password:
+            fields["proxyPassword"] = unquote(parts.password)
+        return fields
+
+    def _task_payload(self, challenge: ChallengeContext) -> dict[str, Any]:
+        proxy_fields = self._proxy_fields()
         task: dict[str, Any] = {
-            "type": TASK_TYPE,
+            # 有代理时必须用带代理的任务类型，否则打码 IP 与注册 IP 会脱节
+            "type": TASK_TYPE_PROXY if proxy_fields else TASK_TYPE_PROXYLESS,
             "websiteURL": challenge.page_url,
             "websiteKey": challenge.sitekey,
         }
+        task.update(proxy_fields)
+        if self.user_agent:
+            task["userAgent"] = self.user_agent
         metadata = {
             key: value
             for key, value in {
@@ -118,12 +153,23 @@ class CapSolverProvider:
         }
         if metadata:
             task["metadata"] = metadata
+        return task
+
+    def acquire(self, challenge: ChallengeContext) -> AcquiredToken:
+        if self.cancelled():
+            raise CapSolverError("CANCELLED", "task cancelled")
+        if not str(challenge.page_url or "").strip():
+            raise ValueError("Turnstile page URL is empty")
+        if not str(challenge.sitekey or "").strip():
+            raise ValueError("Turnstile sitekey is empty")
+
+        task = self._task_payload(challenge)
 
         created = self._post(CREATE_TASK_URL, {"clientKey": self.api_key, "task": task})
         task_id = str(created.get("taskId") or "").strip()
         if not task_id:
             raise CapSolverError("MISSING_TASK_ID", "createTask returned no taskId")
-        self.log(f"[*] CapSolver task created: {task_id}")
+        self.log(f"[*] CapSolver task created: {task_id} (type={task['type']})")
 
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:

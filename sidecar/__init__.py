@@ -1,0 +1,24 @@
+"""Local headless-browser sidecar: Turnstile + Castle token production."""
+
+from sidecar.browser_worker import (
+    BrowserWorker,
+    InteractiveChallengeError,
+    SidecarError,
+    SidecarUnavailable,
+    TokenPair,
+    TurnstileChallengeError,
+)
+from sidecar.service import LocalSidecarService
+from sidecar.token_pool import CachedToken, TokenPool
+
+__all__ = [
+    "BrowserWorker",
+    "CachedToken",
+    "InteractiveChallengeError",
+    "LocalSidecarService",
+    "SidecarError",
+    "SidecarUnavailable",
+    "TokenPair",
+    "TokenPool",
+    "TurnstileChallengeError",
+]

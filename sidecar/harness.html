@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Security Verification</title>
+  <!-- 官方 Cloudflare Turnstile 与 Castle SDK（走与业务同一条代理链路加载） -->
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" async defer></script>
+  <script src="https://d2t77mnxyo7adj.cloudfront.net/v1/c.js"></script>
+  <style>
+    html, body {
+      background: #0f0f0f;
+      color: #fff;
+      font-family: system-ui, sans-serif;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      margin: 0;
+    }
+    #container { text-align: center; }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <div id="cf-turnstile-widget"></div>
+  </div>
+
+  <script>
+    window._turnstileToken = null;
+    window._turnstileError = null;
+    window._widgetId = null;
+    window._castleConfigured = false;
+    window._castleLastError = null;
+
+    // 1. 初始化 Castle SDK（publishable key 由 Python 侧注入）
+    function initCastle(publishableKey) {
+      if (!window._castle) {
+        return false;
+      }
+      try {
+        window._castle('configure', { pk: publishableKey });
+        window._castleConfigured = true;
+        return true;
+      } catch (err) {
+        window._castleLastError = String((err && err.message) || err);
+        return false;
+      }
+    }
+
+    // 2. 提取 Castle Request Token（真实渲染管线 + 真实 Canvas/WebGL 熵）
+    function acquireCastleToken() {
+      return new Promise((resolve, reject) => {
+        if (!window._castle) {
+          reject(new Error('Castle SDK not loaded'));
+          return;
+        }
+        if (!window._castleConfigured) {
+          reject(new Error('Castle SDK not configured'));
+          return;
+        }
+        try {
+          window._castle('createRequestToken')
+            .then(function (token) { resolve(token); })
+            .catch(function (err) {
+              window._castleLastError = String((err && err.message) || err);
+              reject(err);
+            });
+        } catch (err) {
+          reject(err);
+        }
+      });
+    }
+
+    // 3. 渲染 Turnstile 挑战，token 通过全局变量回传给 Python
+    function renderTurnstile(sitekey, action) {
+      window._turnstileToken = null;
+      window._turnstileError = null;
+      if (!window.turnstile) {
+        window._turnstileError = 'TURNSTILE_SDK_NOT_LOADED';
+        return false;
+      }
+      if (window._widgetId !== null) {
+        try { window.turnstile.reset(window._widgetId); } catch (err) { /* ignore */ }
+      }
+      window._widgetId = window.turnstile.render('#cf-turnstile-widget', {
+        sitekey: sitekey,
+        action: action || undefined,
+        theme: 'dark',
+        callback: function (token) { window._turnstileToken = token; },
+        'error-callback': function (code) {
+          window._turnstileError = code || 'UNKNOWN_ERROR';
+        },
+        'expired-callback': function () { window._turnstileToken = null; }
+      });
+      return true;
+    }
+
+    // 4. 环境自检：供 Python 侧判断页面是否真的就绪
+    function harnessStatus() {
+      return {
+        turnstile: typeof window.turnstile !== 'undefined',
+        castle: typeof window._castle !== 'undefined',
+        castleConfigured: window._castleConfigured,
+        webdriver: navigator.webdriver,
+        hardwareConcurrency: navigator.hardwareConcurrency,
+        userAgent: navigator.userAgent,
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+        screen: { width: window.screen.width, height: window.screen.height },
+        languages: navigator.languages ? Array.from(navigator.languages) : []
+      };
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,175 @@
+# CHANGELOG
+
+## v1.1.0 — 本地无头浏览器 Sidecar 与风控一致性改造
+
+本次改动基于两份设计文档实施：`TURNSTILE_SIDECAR_SOLUTION.md`（Sidecar 方案蓝图）与 `PROJECT_ANALYSIS.md`（缺陷评估与重构路线）。核心目标是**消除 IP/指纹裂痕、去掉批量关联特征、补齐工程化短板**，同时保证原生链路（CapSolver + Node JSDOM）作为默认行为不被破坏。
+
+---
+
+## 一、新增：本地无头浏览器 Sidecar（`sidecar/`）
+
+新增可选子系统，用**本机真实 Chromium** 产出 Turnstile 与 Castle 令牌，替代 CapSolver 与 Node JSDOM。
+
+| 文件 | 职责 |
+|------|------|
+| `sidecar/harness.html` | 在 `accounts.x.ai` 域上下文下运行的轻量宿主页，加载官方 Turnstile 与 Castle SDK，并把 Token 回传给 Python |
+| `sidecar/browser_worker.py` | Playwright 常驻实例：启动/渠道降级、路由劫持、Stealth 注入、Token 生产、拟人化点击、Context 软重启 |
+| `sidecar/token_pool.py` | Turnstile 缓冲池：FIFO + TTL 淘汰 + 自适应补水 + 失败上报 + 自愈 |
+| `sidecar/service.py` | 进程内单例门面：`acquire_turnstile` / `acquire_castle` / `status` / `stop`，并提供降级信号 |
+| `providers/local_sidecar.py` | 适配 `HumanVerificationProvider` / `AntiAbuseProvider` 协议，零改动替换原 Provider |
+
+### 1.1 突破 Cloudflare 域名白名单（Origin Spoofing）
+
+Turnstile 初始化时会校验 `window.location.origin` 是否在域名白名单内，本地 `localhost` 会直接报错。实现方式是用 Playwright 路由拦截，把 `https://accounts.x.ai/__turnstile_harness__` 直接 fulfill 成本地 `harness.html`：
+
+```python
+self._page.route(HARNESS_ROUTE_PATTERN, _route_handler)   # 正则匹配，兼容 query string
+self._page.goto(HARNESS_URL, wait_until="domcontentloaded")
+```
+
+浏览器地址栏与 DOM 上下文归属真实注册域，且**不产生任何真实网络请求**。
+
+### 1.2 专用浏览器线程 + 命令队列（修掉方案蓝图里的一个致命坑）
+
+Playwright 同步 API 的事件循环绑定在创建它的线程上。原蓝图里 TokenPool 的补水线程会直接调用 `worker.produce_turnstile_token()`，实机运行会抛：
+
+```
+greenlet.error: Cannot switch to a different thread
+```
+
+而且它**不会**让调用方拿到异常（错误发生在 asyncio 的 done-callback 里），表现为「Token 池永远空、却看不到报错」。本次把 `BrowserWorker` 改成**单线程亲和**模型：
+
+- 所有浏览器操作都投递到一条名为 `sidecar-browser` 的专用线程的命令队列（`queue.Queue` + `Future`）串行执行；
+- 对外仍是同步方法，可被补水线程与并发业务线程安全调用；
+- 初始化失败会把异常**原样回抛**给 `start()`，让 CLI 能做降级判断；
+- 关闭时投递哨兵并 join，`playwright.stop()` 在拥有者线程内执行。
+
+### 1.3 Token 缓冲池
+
+- FIFO 队列 + **240s TTL**（Turnstile 默认 300s，留 60s 安全冗余）；
+- 后台补水线程按 `pool_size`（默认 2）自动补齐，业务侧出队**零延迟**；
+- 连续 3 次失败 → 上报 `proxy_unhealthy` 事件并软重启 Context（提示轮换出口 IP）；
+- 累计产出 100 个 Token → 自动重建 Context，控制 Chromium 长期驻留的内存膨胀；
+- 池空且有超时压力时**降级为实时生成**，不直接失败。
+
+### 1.4 代理闭环
+
+- 浏览器实例挂载与 `PROXY` **完全相同的出口**，`socks5h` 自动转换为 Chromium 可用的 `socks5`（Chromium 本身在代理端做远程解析，语义等价），认证信息拆到 `username`/`password` 字段；
+- 结果是「Turnstile 求解 / Castle 上报 / 发信 RPC / 注册 RPC」四者出口一致，消除跨 ASN 的会话 IP 漂移。
+
+### 1.5 其他
+
+- Stealth 注入只抹除自动化标志（`navigator.webdriver`、`window.chrome`、`plugins`、`permissions.query`），**不伪造** WebGL/Canvas 硬件指纹——真实渲染管线的熵本来就比伪造值更可信；
+- 无头模式下加 `--enable-unsafe-swiftshader`，避免 WebGL 因无 GPU 而不可用；
+- 启动渠道按 `chrome` → `msedge` → 内置 chromium 依次降级，复用系统已装浏览器，无需下载内核；
+- Managed 交互式挑战时做带随机抖动与中间路径的拟人化点击；识别到图形选择网格时抛 `InteractiveChallengeError`，触发代理健康告警。
+
+---
+
+## 二、修复功能缺陷（P0）
+
+### 2.1 CapSolver 代理从未生效
+
+`CapSolverProvider.__init__` 接收并保存了 `proxy`，但 `acquire()` 里硬编码 `AntiTurnstileTaskProxyLess`，`self.proxy` 被完全丢弃——打码 IP 与注册 IP 分属两个网络。
+
+修复：新增 `_proxy_fields()` / `_task_payload()`，有代理时切到 `AntiTurnstileTask` 并传 `proxyType` / `proxyAddress` / `proxyPort` / `proxyLogin` / `proxyPassword`，同时把 `userAgent` 一并传入；代理地址缺端口或协议不支持时明确报错，不再静默退化成 ProxyLess。
+
+### 2.2 其他修复
+
+| 位置 | 问题 | 修复 |
+|------|------|------|
+| `registration/cli.py` | `--events` 帮助文本为 GBK/UTF-8 混用的乱码 | 恢复为「输出脱敏后的 JSONL 进度事件」 |
+| `network/proxy.py` | 报错仍写「浏览器代理暂只支持 HTTP/HTTPS」 | 改为列出实际支持的协议族，去掉过时描述 |
+
+---
+
+## 三、风控与环境一致性
+
+### 3.1 TLS 指纹与 UA 版本对齐
+
+原实现随机取 UA 主版本 126~135，但 Session 固定 `impersonate="chrome"`（约等于 Chrome 120 的 ClientHello），Cloudflare 边缘会判定「指纹与 UA 不一致」。
+
+修复：`network/fingerprint.py` 改为**先**从 `curl_cffi` 实际支持的 impersonate 目标（`chrome120/123/124/131/133a/136/142/145/146/150`…）里在版本窗口内挑选，**再由目标反推 UA 主版本**，两者天然同版本；`AuthProtocolClient` 新增 `impersonate` 参数并把它绑定到指纹，目标不被支持时回落到泛化 `chrome` 并同步更新内部状态。`FINGERPRINT_CHROME_MIN/MAX` 同步上调到 131~150。
+
+### 3.2 `sec-ch-ua` 不再写死
+
+原实现固定拼接 `"Not.A/Brand";v="24"`，是极明显的脚本特征。改为从 6 个真实 Chrome 出现过的 GREASE 占位串中随机选取，并**随机打乱三个品牌的顺序**（Chromium 本身就会打乱）。
+
+### 3.3 `Accept-Language` 与出口区域对齐
+
+默认从 `zh-CN,zh;q=0.9,en;q=0.8` 改为 `en-US,en;q=0.9`，并支持 `FINGERPRINT_REGION`（us/gb/de/fr/jp/kr/sg/hk/tw/cn 映射表）或 `ACCEPT_LANGUAGE` 显式覆盖，避免「挂美国住宅代理却声明中文偏好」。
+
+### 3.4 前端公钥外部化
+
+`PROTOCOL_TURNSTILE_SITEKEY`、`PROTOCOL_CASTLE_PUBLISHABLE_KEY` 改为优先读 `.env`（`PROTOCOL_TURNSTILE_SITEKEY` / `PROTOCOL_CASTLE_PUBLISHABLE_KEY`），缺省才用内置默认值——官方轮换公钥时无需改代码。
+
+---
+
+## 四、防关联治理
+
+| 项 | 原实现 | 现实现 |
+|----|--------|--------|
+| 密码 | 固定 `"N!" + 18 位 + "#7"`，长度恒为 22，一条正则即可全网筛查 | 长度 16~22 随机，四类字符集必含，`SystemRandom` 洗牌，无固定前后缀 |
+| 姓名 | 8×8 = 64 种组合 | 内置 130+ 名字 / 200+ 姓氏池（组合空间 > 26000），并在装了 `faker` 时优先用 `Faker("en_US")` 生成自然人名（按线程缓存实例） |
+
+---
+
+## 五、健壮性
+
+### 5.1 状态机步骤级重试
+
+`ProtocolRegistrationFlow` 每个阶段都包一层指数退避重试（`STEP_ATTEMPTS` 默认 3、`STEP_BACKOFF` 默认 1.5s、上限 `MAX_STEP_BACKOFF` 默认 8s），只对**瞬时故障**重试：超时/连接错误、`RPC transport failed`、gRPC 状态 8/10/13/14（RESOURCE_EXHAUSTED/ABORTED/INTERNAL/UNAVAILABLE）、HTTP 429/500/502/503/504。收信阶段单独放宽重试预算。业务错误（如「邮箱已注册」）立即失败，不做无谓重试。新增 `on_retry` 回调，CLI 会输出 `retry` 事件。
+
+### 5.2 Protobuf 解码扩展性
+
+`parse_message` 增加 WireType 1（fixed64）与 WireType 5（fixed32）支持，不再因为未知 wire type 直接抛 `ProtocolError`。
+
+### 5.3 Sidecar 失败平滑降级
+
+CLI 启动 Sidecar 失败（缺 Playwright、无 Chromium 内核）时打印原因并自动回退到 CapSolver + Node SDK；若此时 `CAPSOLVER_API_KEY` 也缺失，才以配置错误退出（退出码 2）。
+
+---
+
+## 六、工程化
+
+- **测试**：从 2 个文件 4 个用例扩到 **7 个文件 64 个用例**，新增覆盖 `protocol_client`（varint/字段编码/gRPC-Web 帧拆装/WireType 1、5/`CreateUserAndSessionV2` 嵌套字段布局回放）、指纹一致性、CapSolver 代理透传、代理归一化、Token 缓冲池（TTL/补水/降级/健康告警/软重启）、步骤级重试、账号去特征化、Provider 适配层与配置校验。
+- **CLI**：新增 `--sidecar-check`（Sidecar 可用性诊断）与 `--sidecar-produce`（真实产出一次 Turnstile + Castle Token，只打印长度，不打印 Token 内容）；`--check` 输出增加 `sidecar` 字段；Sidecar 模式下不再强制要求 `CAPSOLVER_API_KEY`。
+- **依赖**：`pyproject.toml` 增加 `sidecar`（playwright）与 `faker` 两个可选 extra。
+- **仓库卫生**：新增 `.gitattributes`（统一 LF，避免 Windows 整文件级 diff）；`.gitignore` 补充 `.env.*` 与 `.workbuddy-ai/`。
+
+---
+
+## 七、验证方式
+
+```bash
+# 1. 单元测试
+python -m unittest discover tests          # 64 passed
+
+# 2. 无头浏览器与 Harness 自检
+python main.py --sidecar-check
+
+# 3. 真实产出一次 Turnstile + Castle Token
+python main.py --sidecar-check --sidecar-produce
+```
+
+实机结果（Windows + 本机 Chrome）：
+
+```text
+turnstile=true, castle=true, castleConfigured=true,
+webdriver=null, hardwareConcurrency=8, viewport=1280x800, languages=[en-US, en]
+```
+
+浏览器实例正常启动、路由劫持生效、两套 SDK 均加载成功、`navigator.webdriver` 已抹除，stderr 无 greenlet 报错。
+
+---
+
+## 八、兼容性与破坏性变更
+
+- **无破坏性变更**。`USE_LOCAL_SIDECAR` 默认 `false`，原生链路行为与 v1.0.0 一致（仅修掉了 CapSolver 的代理透传 bug）。
+- 行为差异提醒：默认 `Accept-Language` 由 `zh-CN` 变为 `en-US`；`sec-ch-ua` 与 UA 主版本改为随机轮换。若下游有依赖固定指纹的逻辑需注意。
+
+## 九、后续可选项
+
+- 用正式 `auth_mgmt.proto` + `protoc`/`betterproto` 生成编解码代码，替换手写 varint（本次仅做了 wire type 扩展，未引入代码生成依赖）；
+- `BaseMailProvider` / `BaseCaptchaProvider` 抽象与多供应商热插拔（22.do、TempMail、YesCaptcha、2Captcha…）；
+- 图形选择类交互挑战的自动识别与代理自动轮换。

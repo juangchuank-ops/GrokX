@@ -63,7 +63,9 @@ def parse_proxy_url(raw: str) -> ProxySpec:
         scheme, rest = "http", value
     scheme = scheme.lower().strip()
     if scheme not in {"http", "https", "socks4", "socks4a", "socks5", "socks5h"}:
-        raise ValueError(f"浏览器代理暂只支持 HTTP/HTTPS，上游协议为 {scheme}")
+        raise ValueError(
+            f"暂不支持的代理协议 {scheme}，当前支持 HTTP/HTTPS/SOCKS4/SOCKS5(SOCKS5H)"
+        )
 
     username = password = ""
     if "@" in rest:

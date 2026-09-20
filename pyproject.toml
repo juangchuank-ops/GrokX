@@ -7,5 +7,15 @@ dependencies = [
     "curl_cffi>=0.7",
 ]
 
+[project.optional-dependencies]
+# 本地无头浏览器 Sidecar（替代 CapSolver + Node JSDOM）；复用系统已装的 Chrome/Edge
+sidecar = [
+    "playwright>=1.40",
+]
+# 可选的更自然的人名生成（缺失时回落到内置姓名池）
+faker = [
+    "faker>=25",
+]
+
 [tool.uv]
 package = false

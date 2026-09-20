@@ -79,11 +79,25 @@ def parse_message(data: bytes) -> list[ProtoField]:
         number, wire_type = key >> 3, key & 7
         if wire_type == 0:
             value, offset = decode_varint(data, offset)
+        elif wire_type == 1:
+            # 64-bit 固定长度（fixed64 / double）
+            end = offset + 8
+            if end > len(data):
+                raise ProtocolError("truncated protobuf fixed64 field")
+            value = data[offset:end]
+            offset = end
         elif wire_type == 2:
             length, offset = decode_varint(data, offset)
             end = offset + length
             if end > len(data):
                 raise ProtocolError("truncated protobuf field")
+            value = data[offset:end]
+            offset = end
+        elif wire_type == 5:
+            # 32-bit 固定长度（fixed32 / float）
+            end = offset + 4
+            if end > len(data):
+                raise ProtocolError("truncated protobuf fixed32 field")
             value = data[offset:end]
             offset = end
         else:
@@ -148,9 +162,11 @@ class AuthProtocolClient:
         default_headers: dict[str, str] | None = None,
         timeout: float = 30,
         attempts: int = 3,
+        impersonate: str = "chrome",
     ):
         self.base_url = str(base_url or "").rstrip("/") + "/"
-        self.session = session or requests.Session(impersonate="chrome", proxies=proxies or {})
+        self.impersonate = str(impersonate or "chrome").strip() or "chrome"
+        self.session = session or self._build_session(proxies)
         self.user_agent = str(user_agent or "")
         self.default_headers = {
             str(key).lower(): str(value)
@@ -159,6 +175,16 @@ class AuthProtocolClient:
         }
         self.timeout = max(1.0, float(timeout))
         self.attempts = max(1, int(attempts))
+
+    def _build_session(self, proxies: dict[str, str] | None) -> Any:
+        """按指纹版本建立 Session；目标版本不被支持时回落到泛化 chrome 指纹。"""
+        try:
+            return requests.Session(impersonate=self.impersonate, proxies=proxies or {})
+        except Exception as exc:
+            if self.impersonate == "chrome":
+                raise ProtocolError(f"无法建立 HTTP 会话: {exc}") from exc
+            self.impersonate = "chrome"
+            return requests.Session(impersonate="chrome", proxies=proxies or {})
 
     def _request(self, method: str, url: str, **kwargs: Any) -> Any:
         return getattr(self.session, method.lower())(url, **kwargs)
