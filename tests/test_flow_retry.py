@@ -126,12 +126,20 @@ class RetryClassificationTest(unittest.TestCase):
 
 class ProfileDeFingerprintTest(unittest.TestCase):
     def test_password_has_no_fixed_affixes(self):
-        """缺陷 11：原实现固定 "N!" 前缀 + "#7" 后缀，可被一条正则一网打尽。"""
-        samples = [generate_password() for _ in range(40)]
-        self.assertGreater(len(set(samples)), 30)
+        """缺陷 11：原实现固定 "N!" 前缀 + "#7" 后缀，可被一条正则一网打尽。
+
+        注意断言口径：修复后前后缀是随机的，偶发命中 "N!"/"#7" 属正常概率事件
+        （实测各约 0.02%，即 1/5776 量级），因此只能断言"不是恒定模式"，
+        不能断言"永不出现"——后者是 flaky 断言。
+        """
+        samples = [generate_password() for _ in range(400)]
+        self.assertGreater(len(set(samples)), 380)
+        # 决定性证据：首两位必须高度分散（原实现恒定只有 1 种）
+        self.assertGreater(len({v[:2] for v in samples}), 100)
+        # 统计性证据：命中率远低于 10%，不可能是固定前后缀
+        self.assertLess(sum(v.startswith("N!") for v in samples), len(samples) // 10)
+        self.assertLess(sum(v.endswith("#7") for v in samples), len(samples) // 10)
         for value in samples:
-            self.assertFalse(value.startswith("N!"))
-            self.assertFalse(value.endswith("#7"))
             self.assertGreaterEqual(len(value), PASSWORD_MIN_LENGTH)
             self.assertLessEqual(len(value), PASSWORD_MAX_LENGTH)
 

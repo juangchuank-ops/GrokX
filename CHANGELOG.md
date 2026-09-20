@@ -156,15 +156,28 @@ CLI 启动 Sidecar 失败（缺 Playwright、无 Chromium 内核）时打印原�
 
 - **测试**：从 2 个文件 4 个用例扩到 **7 个文件 75 个用例**，新增覆盖 `protocol_client`（varint/字段编码/gRPC-Web 帧拆装/WireType 1、5/`CreateUserAndSessionV2` 嵌套字段布局回放）、指纹一致性、CapSolver 代理透传、代理归一化、Token 缓冲池（TTL/补水/降级/健康告警/软重启）、步骤级重试、账号去特征化、Provider 适配层、双轨容灾回退、自检容器隔离与配置校验。
 - **CLI**：新增 `--sidecar-check`（Sidecar 可用性诊断）与 `--sidecar-produce`（真实产出一次 Turnstile + Castle Token，并含官方测试 key 自检；只打印长度，不打印 Token 内容）；`--check` 输出增加 `sidecar` 字段；Sidecar 模式下不再强制要求 `CAPSOLVER_API_KEY`。
-- **依赖**：`pyproject.toml` 增加 `sidecar`（playwright）与 `faker` 两个可选 extra。
+- **依赖**：`pyproject.toml` 增加 `sidecar`（playwright）与 `faker` 两个可选 extra；同步重新生成 `uv.lock`（此前 lock 未随 extra 更新，导致 `uv run` 会静默把 `curl-cffi` 降级回 0.15.0 并移除 `faker`）。已用 `uv run --frozen` 按锁定版本复跑，75 用例全绿。
 - **仓库卫生**：新增 `.gitattributes`（统一 LF，避免 Windows 整文件级 diff）；`.gitignore` 补充 `.env.*` 与 `.workbuddy-ai/`。
+
+### 6.1 修掉一个 flaky 断言（交付前复跑暴露）
+
+`ProfileDeFingerprintTest::test_password_has_no_fixed_affixes` 原写法是「40 个样本中不得出现 `N!` 开头 / `#7` 结尾」。
+
+问题在于修复后前后缀已是均匀随机，偶发命中属正常概率事件：20 万次采样实测命中率各约 **0.02%**（`1/76²`，即 1/5776 量级），换算到 40 个样本，原断言**单次运行约 1% 概率误报失败**。这不是产品缺陷，是断言口径错了——它要求随机生成器"永不"产出某个值，而随机生成器给不了这个保证。
+
+已改为断言"不是恒定模式"，两条证据互补：
+
+- **决定性**：400 个样本的首两位须分散出 >100 种取值（原实现恒定只有 `N!` 一种）；
+- **统计性**：`N!` / `#7` 命中数须远低于样本数的 10%。
+
+修复后连跑 5 次，75 用例全绿。
 
 ---
 
 ## 七、验证方式与实测结果
 
 ```bash
-# 1. 单元测试
+# 1. 单元测试（连跑 5 次确认无 flaky）
 python -m unittest discover tests          # 75 passed
 
 # 2. 无头浏览器与 Harness 自检
