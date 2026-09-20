@@ -156,7 +156,23 @@ CLI 启动 Sidecar 失败（缺 Playwright、无 Chromium 内核）时打印原�
 
 - **测试**：从 2 个文件 4 个用例扩到 **7 个文件 75 个用例**，新增覆盖 `protocol_client`（varint/字段编码/gRPC-Web 帧拆装/WireType 1、5/`CreateUserAndSessionV2` 嵌套字段布局回放）、指纹一致性、CapSolver 代理透传、代理归一化、Token 缓冲池（TTL/补水/降级/健康告警/软重启）、步骤级重试、账号去特征化、Provider 适配层、双轨容灾回退、自检容器隔离与配置校验。
 - **CLI**：新增 `--sidecar-check`（Sidecar 可用性诊断）与 `--sidecar-produce`（真实产出一次 Turnstile + Castle Token，并含官方测试 key 自检；只打印长度，不打印 Token 内容）；`--check` 输出增加 `sidecar` 字段；Sidecar 模式下不再强制要求 `CAPSOLVER_API_KEY`。
-- **依赖**：`pyproject.toml` 增加 `sidecar`（playwright）与 `faker` 两个可选 extra；同步重新生成 `uv.lock`（此前 lock 未随 extra 更新，导致 `uv run` 会静默把 `curl-cffi` 降级回 0.15.0 并移除 `faker`）。已用 `uv run --frozen` 按锁定版本复跑，75 用例全绿。
+- **依赖**：`pyproject.toml` 增加 `sidecar`（playwright）与 `faker` 两个可选 extra。
+
+### 6.2 修掉一个早已失效的 `uv.lock`
+
+仓库里的 `uv.lock` 是**孤儿文件**，与 `pyproject.toml` 完全对不上，且在我动手之前就已经失效：
+
+| | 项目名 | 版本 | 包数 |
+|---|---|---|---|
+| `pyproject.toml` | `grok-reg-protocol` | 1.0.0 | 1 个直接依赖（`curl_cffi`） |
+| 原 `uv.lock` | `grok-reg-protocol-cpa` | 1.1.0 | 29 个（含 `drissionpage`/`lxml`/`openpyxl`/`tldextract` 等 DrissionPage 时代残留） |
+
+在上游 base 提交上执行 `uv lock --check` 即可复现失败（`The lockfile at uv.lock needs to be updated`），也就是说它与本次改动无关，是历史遗留。
+
+危害是实打实的：任何 `uv run` / `uv sync` 都会按这份错误锁文件同步环境——本次定位 flaky 断言时就现场撞上了，`uv run` 把已装好的 `curl-cffi` 从 0.16.3 **静默降级**到 0.15.0 并移除了 `faker`。
+
+已重新生成：15 个包，`uv lock --check` 通过，并用 `uv run --frozen` 按锁定版本复跑 75 用例全绿。顺带确认 `curl-cffi` 0.15.0 的 impersonate 目标已覆盖 `chrome146`，指纹版本窗口（131–150）在两个版本下均可用。
+
 - **仓库卫生**：新增 `.gitattributes`（统一 LF，避免 Windows 整文件级 diff）；`.gitignore` 补充 `.env.*` 与 `.workbuddy-ai/`。
 
 ### 6.1 修掉一个 flaky 断言（交付前复跑暴露）
